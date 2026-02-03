@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 from typing import Any
 
 from ..core.config import get_settings
@@ -71,6 +72,7 @@ class SAM3Services:
             if settings.imgsz is not None:
                 overrides["imgsz"] = settings.imgsz
             self._video_predictor = SAM3VideoPredictor(overrides=overrides)
+            _harden_ultralytics_stream_predictor(self._video_predictor)
         return self._video_predictor
 
     def get_video_semantic_predictor(self):
@@ -89,7 +91,40 @@ class SAM3Services:
             if settings.imgsz is not None:
                 overrides["imgsz"] = settings.imgsz
             self._video_semantic_predictor = SAM3VideoSemanticPredictor(overrides=overrides)
+            _harden_ultralytics_stream_predictor(self._video_semantic_predictor)
         return self._video_semantic_predictor
+
+
+def _harden_ultralytics_stream_predictor(predictor: Any) -> None:
+    """Avoid Ultralytics crashes in stream_inference write_results/verbose.
+
+    Some Ultralytics versions can raise IndexError inside result.verbose() when writing results.
+    We don't rely on Ultralytics to save/print results; we only consume yielded frames and
+    write our own output video, so it's safe to noop write_results.
+    """
+
+    def _noop_write_results(*args: Any, **kwargs: Any) -> str:
+        return ""
+
+    try:
+        predictor.write_results = types.MethodType(_noop_write_results, predictor)
+    except Exception:
+        # If monkeypatch fails, keep default behavior.
+        return
+
+    # Best-effort: disable internal saving/logging knobs if present.
+    for attr, value in (
+        ("save", False),
+        ("save_txt", False),
+        ("save_conf", False),
+        ("show", False),
+        ("verbose", False),
+    ):
+        try:
+            if hasattr(predictor, "args") and hasattr(predictor.args, attr):
+                setattr(predictor.args, attr, value)
+        except Exception:
+            pass
 
 
 _services: SAM3Services | None = None

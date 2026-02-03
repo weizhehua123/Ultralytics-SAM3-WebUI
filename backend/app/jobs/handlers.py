@@ -24,6 +24,37 @@ def _save_mask_png(mask: np.ndarray, out_path: Path) -> None:
     img.save(out_path)
 
 
+def _normalize_result_item(r: Any) -> Any:
+    # Some Ultralytics predictors may yield lists/tuples per step.
+    if isinstance(r, (list, tuple)):
+        return r[0] if r else None
+    return r
+
+
+def _safe_frame_from_result(r0: Any) -> Any:
+    """Return a BGR frame from a Ultralytics Result-like object.
+
+    Ultralytics Results.plot() can raise IndexError when names/classes metadata is inconsistent.
+    We treat plotting as best-effort and fall back to the raw frame.
+    """
+    if r0 is None:
+        return None
+
+    if hasattr(r0, "plot"):
+        try:
+            return r0.plot()
+        except IndexError:
+            # Try disabling labels if supported.
+            try:
+                return r0.plot(labels=False)
+            except Exception:
+                return getattr(r0, "orig_img", None)
+        except Exception:
+            return getattr(r0, "orig_img", None)
+
+    return getattr(r0, "orig_img", None)
+
+
 def handle_image_text(job: Job, jm) -> None:
     job_dir = jm.job_dir(job.id)
     input_path = Path(job.payload["image_path"])
@@ -53,9 +84,8 @@ def handle_image_text(job: Job, jm) -> None:
     overlay_path = out_dir / "overlay.png"
     masks_dir = out_dir / "masks"
 
-    overlay = None
-    if hasattr(r0, "plot"):
-        overlay = r0.plot()
+    overlay = _safe_frame_from_result(r0)
+    if overlay is not None:
         cv2.imwrite(str(overlay_path), overlay)
 
     masks_saved = []
@@ -99,8 +129,9 @@ def handle_image_exemplar(job: Job, jm) -> None:
     overlay_path = out_dir / "overlay.png"
     masks_dir = out_dir / "masks"
 
-    if hasattr(r0, "plot"):
-        cv2.imwrite(str(overlay_path), r0.plot())
+    overlay = _safe_frame_from_result(r0)
+    if overlay is not None:
+        cv2.imwrite(str(overlay_path), overlay)
 
     masks_saved = []
     if hasattr(r0, "masks") and getattr(r0, "masks") is not None and hasattr(r0.masks, "data"):
@@ -208,10 +239,17 @@ def _video_props(video_path: Path) -> tuple[float, int, int, int]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"failed to open video: {video_path}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1e-6:
+        fps = 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if w <= 0 or h <= 0:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     cap.release()
     return fps, w, h, n
 
@@ -231,12 +269,19 @@ def handle_video_bbox(job: Job, jm) -> None:
 
     out_video = out_dir / "output.mp4"
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(f"failed to open VideoWriter for: {out_video} (w={w}, h={h}, fps={fps})")
 
     i = 0
     for r in predictor(source=str(video_path), bboxes=bboxes, stream=True):
-        frame = r.plot() if hasattr(r, "plot") else getattr(r, "orig_img", None)
+        r0 = _normalize_result_item(r)
+        if r0 is None:
+            continue
+        frame = _safe_frame_from_result(r0)
         if frame is None:
             continue
+        if frame.shape[1] != w or frame.shape[0] != h:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
         writer.write(frame)
         i += 1
         if total > 0:
@@ -252,6 +297,8 @@ def handle_video_bbox(job: Job, jm) -> None:
 def handle_video_text(job: Job, jm) -> None:
     video_path = Path(job.payload["video_path"])
     prompt = str(job.payload["prompt"]).strip()
+    if not prompt:
+        raise RuntimeError("empty prompt")
 
     fps, w, h, total = _video_props(video_path)
 
@@ -263,20 +310,43 @@ def handle_video_text(job: Job, jm) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_video = out_dir / "output.mp4"
-    writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    def _open_writer() -> cv2.VideoWriter:
+        w0 = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        if not w0.isOpened():
+            raise RuntimeError(f"failed to open VideoWriter for: {out_video} (w={w}, h={h}, fps={fps})")
+        return w0
 
-    i = 0
-    for r in predictor(source=str(video_path), text=[prompt], stream=True):
-        frame = r.plot() if hasattr(r, "plot") else getattr(r, "orig_img", None)
-        if frame is None:
-            continue
-        writer.write(frame)
-        i += 1
-        if total > 0:
-            job.progress = min(0.99, i / float(total))
-            jm.persist(job)
+    def _run_stream(text_arg: Any) -> int:
+        writer = _open_writer()
+        frames = 0
+        try:
+            for r in predictor(source=str(video_path), text=text_arg, stream=True):
+                r0 = _normalize_result_item(r)
+                if r0 is None:
+                    continue
+                frame = _safe_frame_from_result(r0)
+                if frame is None:
+                    continue
+                if frame.shape[1] != w or frame.shape[0] != h:
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                writer.write(frame)
+                frames += 1
+                if total > 0:
+                    job.progress = min(0.99, frames / float(total))
+                    jm.persist(job)
+        finally:
+            writer.release()
+        return frames
 
-    writer.release()
+    # First try the documented style: text=[prompt]. If Ultralytics raises IndexError internally,
+    # retry using a plain string prompt, which some versions accept.
+    try:
+        i = _run_stream([prompt])
+    except IndexError:
+        try:
+            i = _run_stream(prompt)
+        except Exception as e:
+            raise RuntimeError(f"video semantic tracking failed: {type(e).__name__}: {e}")
 
     job.result = JobResult(files={"video": _files_url(f"{out_rel_dir}/output.mp4")}, meta={"frames": i, "prompt": prompt})
     jm.persist(job)

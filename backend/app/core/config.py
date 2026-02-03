@@ -36,7 +36,10 @@ class Settings(BaseSettings):
     device: str = Field(default=os.getenv("SAM3_DEVICE", ""))
     half: bool = Field(default=os.getenv("SAM3_HALF", "1") not in {"0", "false", "False"})
     conf: float = Field(default=float(os.getenv("SAM3_CONF", "0.25")))
-    imgsz: int | None = Field(default=int(os.getenv("SAM3_IMGSZ", "0")) or None)
+    # Default to 644 to avoid Ultralytics warning:
+    # "imgsz=[640] must be multiple of max stride 14, updating to [644]"
+    # Set SAM3_IMGSZ=0 to let Ultralytics pick its own default.
+    imgsz: int | None = Field(default=int(os.getenv("SAM3_IMGSZ", "644")) or None)
 
     results_dir: str = Field(default=os.getenv("RESULTS_DIR", _default_results_dir()))
 

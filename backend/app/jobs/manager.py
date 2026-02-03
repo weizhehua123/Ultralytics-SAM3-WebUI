@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import uuid
@@ -12,6 +13,9 @@ from .store import JobStore
 
 
 JobHandler = Callable[[Job, "JobManager"], None]
+
+
+logger = logging.getLogger(__name__)
 
 
 class JobManager:
@@ -103,9 +107,13 @@ class JobManager:
                 job.finished_at = now_iso()
                 self._store.upsert(job)
             except Exception as e:
+                logger.exception("Job failed: id=%s type=%s", job.id, job.type)
                 job.status = "failed"
                 job.finished_at = now_iso()
-                job.error = JobError(message=str(e))
+                msg = str(e)
+                if not msg:
+                    msg = repr(e)
+                job.error = JobError(message=f"{type(e).__name__}: {msg}")
                 self._store.upsert(job)
 
 
