@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 
 from ..core.errors import http_400
 from ..jobs.manager import get_job_manager
@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/track/bbox")
-async def track_bbox(video: UploadFile, init_bboxes_json: str):
+async def track_bbox(video: UploadFile = File(...), init_bboxes_json: str = Form(...)):
     try:
         bboxes = json.loads(init_bboxes_json)
     except Exception:
@@ -28,7 +28,7 @@ async def track_bbox(video: UploadFile, init_bboxes_json: str):
 
 
 @router.post("/track/text")
-async def track_text(video: UploadFile, prompt: str):
+async def track_text(video: UploadFile = File(...), prompt: str = Form(...)):
     if not prompt or not prompt.strip():
         raise http_400("prompt is required")
     jm = get_job_manager()

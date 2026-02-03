@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 
 from ..core.errors import http_400
 from ..jobs.manager import get_job_manager
@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/segment/text")
-async def segment_text(image: UploadFile, prompt: str):
+async def segment_text(image: UploadFile = File(...), prompt: str = Form(...)):
     if not prompt or not prompt.strip():
         raise http_400("prompt is required")
     jm = get_job_manager()
@@ -26,7 +26,7 @@ async def segment_text(image: UploadFile, prompt: str):
 
 
 @router.post("/segment/exemplar")
-async def segment_exemplar(image: UploadFile, bboxes_json: str):
+async def segment_exemplar(image: UploadFile = File(...), bboxes_json: str = Form(...)):
     try:
         bboxes = json.loads(bboxes_json)
     except Exception:
@@ -45,7 +45,7 @@ async def segment_exemplar(image: UploadFile, bboxes_json: str):
 
 
 @router.post("/embedding")
-async def create_embedding(image: UploadFile, ttl_sec: int = 1800):
+async def create_embedding(image: UploadFile = File(...), ttl_sec: int = Form(1800)):
     jm = get_job_manager()
     job_id = uuid.uuid4().hex
     job_dir = jm.job_dir(job_id)

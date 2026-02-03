@@ -460,11 +460,18 @@
             return await res.json();
         }
 
-        async function pollJob(jobId) {
+        async function pollJob(jobId, { timeoutMs = 10 * 60 * 1000, onUpdate = null } = {}) {
+            const t0 = Date.now();
             while (true) {
                 const res = await fetch('/api/v1/jobs/' + jobId);
+                if (!res.ok) {
+                    const t = await res.text();
+                    throw new Error(t || ('HTTP ' + res.status));
+                }
                 const job = await res.json();
+                if (onUpdate) onUpdate(job);
                 if (job.status === 'succeeded' || job.status === 'failed') return job;
+                if (Date.now() - t0 > timeoutMs) throw new Error('job timeout: ' + jobId);
                 await new Promise(r => setTimeout(r, 800));
             }
         }
@@ -525,7 +532,12 @@
                         return;
                     }
 
-                    const job = await pollJob(jobId);
+                    const job = await pollJob(jobId, {
+                        onUpdate: (j) => {
+                            const p = (typeof j.progress === 'number') ? Math.round(j.progress * 100) : null;
+                            text.textContent = '处理中...' + (p !== null ? (' ' + p + '%') : '');
+                        }
+                    });
                     if (job.status !== 'succeeded') throw new Error(job.error?.message || 'job failed');
 
                     const overlay = job.result?.files?.overlay;
