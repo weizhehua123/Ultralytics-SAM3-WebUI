@@ -251,11 +251,15 @@
                         </div>
                         
                         <div id="image-sample-section" class="card hidden">
-                            <h3 class="text-lg font-semibold text-white mb-4">参考图像</h3>
-                            <div onclick="document.getElementById('sample-input').click()" class="border-2 border-dashed border-slate-600 rounded-xl p-6 text-center cursor-pointer hover:border-purple-500/50">
-                                <p class="text-slate-400">上传参考图像</p>
-                            </div>
-                            <input id="sample-input" type="file" accept="image/*" class="hidden" onchange="handleSampleUpload(event)">
+                            <h3 class="text-lg font-semibold text-white mb-4">样本提示（示例框）</h3>
+                            <textarea id="exemplar-bboxes" placeholder='示例：[[100,120,350,420]] 或 [[x1,y1,x2,y2],[...]]' class="input-field h-24 resize-none"></textarea>
+                            <p class="text-slate-500 text-sm mt-2">说明：SAM3 的“图像样本”以目标图像上的示例框作为 exemplar 提示。</p>
+                        </div>
+
+                        <div id="multi-prompt-section" class="card hidden">
+                            <h3 class="text-lg font-semibold text-white mb-4">多重查询（文本）</h3>
+                            <textarea id="multi-prompts" placeholder="示例：person, bicycle, bus" class="input-field h-24 resize-none"></textarea>
+                            <p class="text-slate-500 text-sm mt-2">会先提取一次图像特征，再按多个 prompt 依次查询。</p>
                         </div>
                         
                         <button onclick="processSegmentation()" id="segment-btn" class="w-full btn-primary justify-center" disabled>
@@ -317,6 +321,12 @@
                             <input id="video-input" type="file" accept="video/*" class="hidden" onchange="handleVideoUpload(event)">
                         </div>
                         
+                        <div id="video-bbox-section" class="card">
+                            <h3 class="text-lg font-semibold text-white mb-4">初始边界框（JSON）</h3>
+                            <textarea id="video-bboxes" class="input-field h-24 resize-none">[[100,100,400,400]]</textarea>
+                            <p class="text-slate-500 text-sm mt-2">格式：[[x1,y1,x2,y2]]，像素坐标。</p>
+                        </div>
+
                         <div id="video-text-section" class="card hidden">
                             <h3 class="text-lg font-semibold text-white mb-4">文本提示</h3>
                             <textarea id="video-prompt" placeholder="描述要跟踪的对象..." class="input-field h-24 resize-none"></textarea>
@@ -383,6 +393,8 @@
             
             document.getElementById('text-prompt-section').classList.toggle('hidden', mode !== 'text');
             document.getElementById('image-sample-section').classList.toggle('hidden', mode !== 'image');
+            document.getElementById('multi-prompt-section').classList.toggle('hidden', mode !== 'multi');
+            updateSegmentButton();
         }
         
         function handleImageUpload(e) {
@@ -415,12 +427,47 @@
             const btn = document.getElementById('segment-btn');
             if (currentImageMode === 'text') {
                 btn.disabled = !hasImage || !document.getElementById('text-prompt').value.trim();
+            } else if (currentImageMode === 'multi') {
+                btn.disabled = !hasImage || !document.getElementById('multi-prompts').value.trim();
             } else {
                 btn.disabled = !hasImage;
             }
         }
         
         document.getElementById('text-prompt').addEventListener('input', updateSegmentButton);
+        document.getElementById('exemplar-bboxes').addEventListener('input', updateSegmentButton);
+        document.getElementById('multi-prompts').addEventListener('input', updateSegmentButton);
+
+        async function apiPostForm(url, formData) {
+            const res = await fetch(url, { method: 'POST', body: formData });
+            if (!res.ok) {
+                const t = await res.text();
+                throw new Error(t || ('HTTP ' + res.status));
+            }
+            return await res.json();
+        }
+
+        async function apiPostJson(url, payload) {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+                const t = await res.text();
+                throw new Error(t || ('HTTP ' + res.status));
+            }
+            return await res.json();
+        }
+
+        async function pollJob(jobId) {
+            while (true) {
+                const res = await fetch('/api/v1/jobs/' + jobId);
+                const job = await res.json();
+                if (job.status === 'succeeded' || job.status === 'failed') return job;
+                await new Promise(r => setTimeout(r, 800));
+            }
+        }
         
         function processSegmentation() {
             const btn = document.getElementById('segment-btn');
@@ -430,13 +477,73 @@
             btn.disabled = true;
             spinner.classList.remove('hidden');
             text.textContent = '处理中...';
-            
-            setTimeout(() => {
-                btn.disabled = false;
-                spinner.classList.add('hidden');
-                text.textContent = '开始分割';
-                alert('分割完成！(演示模式)');
-            }, 2000);
+
+            (async () => {
+                try {
+                    const imageFile = document.getElementById('image-input').files[0];
+                    if (!imageFile) throw new Error('请先上传图片');
+
+                    let jobId = null;
+
+                    if (currentImageMode === 'text') {
+                        const prompt = document.getElementById('text-prompt').value.trim();
+                        const fd = new FormData();
+                        fd.append('image', imageFile);
+                        fd.append('prompt', prompt);
+                        const r = await apiPostForm('/api/v1/image/segment/text', fd);
+                        jobId = r.job_id;
+                    } else if (currentImageMode === 'image') {
+                        const bboxesJson = document.getElementById('exemplar-bboxes').value.trim() || '[]';
+                        const fd = new FormData();
+                        fd.append('image', imageFile);
+                        fd.append('bboxes_json', bboxesJson);
+                        const r = await apiPostForm('/api/v1/image/segment/exemplar', fd);
+                        jobId = r.job_id;
+                    } else {
+                        // multi: embedding -> query each prompt sequentially (show last overlay/mask)
+                        const prompts = document.getElementById('multi-prompts').value.split(',').map(s => s.trim()).filter(Boolean);
+                        const fdEmb = new FormData();
+                        fdEmb.append('image', imageFile);
+                        const embResp = await apiPostForm('/api/v1/image/embedding', fdEmb);
+                        const embJob = await pollJob(embResp.job_id);
+                        if (embJob.status !== 'succeeded') throw new Error(embJob.error?.message || 'embedding failed');
+                        const embeddingId = embJob.result?.meta?.embedding_id;
+                        if (!embeddingId) throw new Error('embedding_id not found');
+
+                        for (const p of prompts) {
+                            const qResp = await apiPostJson('/api/v1/image/query', { embedding_id: embeddingId, query: { type: 'text', prompt: p } });
+                            const qJob = await pollJob(qResp.job_id);
+                            if (qJob.status !== 'succeeded') throw new Error(qJob.error?.message || 'query failed');
+                            const masks = qJob.result?.files?.masks || [];
+                            if (masks.length > 0) {
+                                document.getElementById('result-image').src = masks[0];
+                                document.getElementById('result-image').classList.remove('hidden');
+                                document.getElementById('image-placeholder').classList.add('hidden');
+                            }
+                        }
+
+                        return;
+                    }
+
+                    const job = await pollJob(jobId);
+                    if (job.status !== 'succeeded') throw new Error(job.error?.message || 'job failed');
+
+                    const overlay = job.result?.files?.overlay;
+                    const masks = job.result?.files?.masks || [];
+                    const showUrl = overlay || (masks.length ? masks[0] : null);
+                    if (!showUrl) throw new Error('no result files');
+
+                    document.getElementById('result-image').src = showUrl;
+                    document.getElementById('result-image').classList.remove('hidden');
+                    document.getElementById('image-placeholder').classList.add('hidden');
+                } catch (e) {
+                    alert('分割失败：' + (e.message || e));
+                } finally {
+                    spinner.classList.add('hidden');
+                    text.textContent = '开始分割';
+                    updateSegmentButton();
+                }
+            })();
         }
         
         // Video Mode
@@ -448,6 +555,7 @@
             document.querySelectorAll('[id^="vid-mode-"]').forEach(btn => btn.classList.remove('active'));
             document.getElementById('vid-mode-' + mode).classList.add('active');
             document.getElementById('video-text-section').classList.toggle('hidden', mode !== 'text');
+            document.getElementById('video-bbox-section').classList.toggle('hidden', mode !== 'bbox');
         }
         
         function handleVideoUpload(e) {
@@ -482,13 +590,47 @@
             btn.disabled = true;
             spinner.classList.remove('hidden');
             text.textContent = '处理中...';
-            
-            setTimeout(() => {
-                btn.disabled = false;
-                spinner.classList.add('hidden');
-                text.textContent = '开始跟踪';
-                alert('跟踪完成！(演示模式)');
-            }, 3000);
+
+            (async () => {
+                try {
+                    const videoFile = document.getElementById('video-input').files[0];
+                    if (!videoFile) throw new Error('请先上传视频');
+
+                    let jobId = null;
+                    if (currentVideoMode === 'bbox') {
+                        const b = document.getElementById('video-bboxes').value.trim() || '[]';
+                        const fd = new FormData();
+                        fd.append('video', videoFile);
+                        fd.append('init_bboxes_json', b);
+                        const r = await apiPostForm('/api/v1/video/track/bbox', fd);
+                        jobId = r.job_id;
+                    } else {
+                        const prompt = document.getElementById('video-prompt').value.trim();
+                        const fd = new FormData();
+                        fd.append('video', videoFile);
+                        fd.append('prompt', prompt);
+                        const r = await apiPostForm('/api/v1/video/track/text', fd);
+                        jobId = r.job_id;
+                    }
+
+                    const job = await pollJob(jobId);
+                    if (job.status !== 'succeeded') throw new Error(job.error?.message || 'job failed');
+                    const outVideo = job.result?.files?.video;
+                    if (!outVideo) throw new Error('no output video');
+
+                    const v = document.getElementById('result-video');
+                    v.src = outVideo;
+                    v.classList.remove('hidden');
+                    document.getElementById('video-placeholder').classList.add('hidden');
+                    v.load();
+                } catch (e) {
+                    alert('跟踪失败：' + (e.message || e));
+                } finally {
+                    spinner.classList.add('hidden');
+                    text.textContent = '开始跟踪';
+                    btn.disabled = !hasVideo;
+                }
+            })();
         }
         
         // Drag and drop
